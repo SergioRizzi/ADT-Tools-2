@@ -36,6 +36,28 @@ definition(
 * 1/30/2019 2.0.2
 * Updated notification routine to allow for usage of multiple SMS numbers.
 *
+* 3/12/2019 2.0.2a
+* Corrected bug for notifications in the new app.
+*
+* 3/15/2019 2.0.2b
+* Changed flag for Push notifications to a different type 
+*
+* 3/22/2019 2.0.3
+* Add Panic alert Child app to allow monitoring for Panic events from Keyfobs and Panel
+*
+* 6/14/2019 2.0.4
+* Corrected issue with About page displaying properlly
+* Updated menu options with ability to control switches on alarm mode change
+*
+* 01/22/2020 2.0.5
+* Added ability to use PushOver notification 
+*
+* 02/23/2020 2.06
+* Added flagging for Virtual button creation. This should prevent issues if you don't turn off the flag to create the virtual buttons.
+*
+* 08/22/2020 2.06a
+* Updated Mode change command to use true value instead of commmand value.
+*
 */
 
 preferences
@@ -43,19 +65,43 @@ preferences
 	page (name: "mainPage", title: "ADT Tools")
 	page (name: "adtNotifier", title: "ADT Custom Notification")
 	page (name: "adtModeChange", title: "Setup mode change settings")
+	page (name: "adtModeAction", title: "Setup Action on Mode Change")    
 	page (name: "adtAlertActions", title: "Work with ADT alarm alert actions")
    	page (name: "optionalSettings", title: "Optional Setup")
     page (name: "about", title: "About ADT Tools")
 }
 
+//PushOver-Manager Input Generation Functions
+private getPushoverSounds(){return (Map) atomicState?.pushoverManager?.sounds?:[:]}
+private getPushoverDevices(){List opts=[];Map pmd=atomicState?.pushoverManager?:[:];pmd?.apps?.each{k,v->if(v&&v?.devices&&v?.appId){Map dm=[:];v?.devices?.sort{}?.each{i->dm["${i}_${v?.appId}"]=i};addInputGrp(opts,v?.appName,dm);}};return opts;}
+private inputOptGrp(List groups,String title){def group=[values:[],order:groups?.size()];group?.title=title?:"";groups<<group;return groups;}
+private addInputValues(List groups,String key,String value){def lg=groups[-1];lg["values"]<<[key:key,value:value,order:lg["values"]?.size()];return groups;}
+private listToMap(List original){original.inject([:]){r,v->r[v]=v;return r;}}
+private addInputGrp(List groups,String title,values){if(values instanceof List){values=listToMap(values)};values.inject(inputOptGrp(groups,title)){r,k,v->return addInputValues(r,k,v)};return groups;}
+private addInputGrp(values){addInputGrp([],null,values)}
+//PushOver-Manager Location Event Subscription Events, Polling, and Handlers
+public pushover_init(){subscribe(location,"pushoverManager",pushover_handler);pushover_poll()}
+public pushover_cleanup(){state?.remove("pushoverManager");unsubscribe("pushoverManager");}
+public pushover_poll(){sendLocationEvent(name:"pushoverManagerCmd",value:"poll",data:[empty:true],isStateChange:true,descriptionText:"Sending Poll Event to Pushover-Manager")}
+public pushover_msg(List devs,Map data){if(devs&&data){sendLocationEvent(name:"pushoverManagerMsg",value:"sendMsg",data:data,isStateChange:true,descriptionText:"Sending Message to Pushover Devices: ${devs}");}}
+public pushover_handler(evt){Map pmd=atomicState?.pushoverManager?:[:];switch(evt?.value){case"refresh":def ed = evt?.jsonData;String id = ed?.appId;Map pA = pmd?.apps?.size() ? pmd?.apps : [:];if(id){pA[id]=pA?."${id}"instanceof Map?pA[id]:[:];pA[id]?.devices=ed?.devices?:[];pA[id]?.appName=ed?.appName;pA[id]?.appId=id;pmd?.apps = pA;};pmd?.sounds=ed?.sounds;break;case "reset":pmd=[:];break;};atomicState?.pushoverManager=pmd;}
+//Builds Map Message object to send to Pushover Manager
+private buildPushMessage(List devices,Map msgData,timeStamp=false){if(!devices||!msgData){return};Map data=[:];data?.appId=app?.getId();data.devices=devices;data?.msgData=msgData;if(timeStamp){data?.msgData?.timeStamp=new Date().getTime()};pushover_msg(devices,data);}
+
+
 def initialize() {
     // nothing needed here, since the child apps will handle preferences/subscriptions
     // this just logs some messages for demo/information purposes
+    pushover_init()
     log.debug "there are ${childApps.size()} child smartapps"
     childApps.each {child ->
         log.debug "child app: ${child.label}"
     }
     if (settings.createVirtButton) {
+    	if (state.crtVrtButton) {
+        log.debug "Virtual buttons already created, Will not create buttons"
+        }
+        else {
     				log.debug "initialize: Creating virtual button devices ADT Mode Change"
 				addChildDevice("Mavrrick", "ADT Tools Button", "ADT Tools Disarmed", location.hubs[0].id, [
 					"name": "ADT Tools Disarmed",
@@ -72,9 +118,18 @@ def initialize() {
 					"label": "ADT Tools Armed Away",
 					"completedSetup": true, 					
 				])
+                state?.crtVrtButton = true
                 log.debug "ADT Tools Alarm Buttons created"
                 }
-	}
+		}
+      	else {
+        state?.crtVrtButton = false
+//    	deleteChildDevice("ADT Tools Disarmed")
+//        deleteChildDevice("ADT Tools Armed Stay")
+//        deleteChildDevice("ADT Tools Armed Away")
+		}
+    }
+    
 
 
 /*
@@ -111,7 +166,7 @@ def adtNotifier()
 	section("Set Message for each state"){
 		input "messageDisarmed", "text", title: "Send this message if alarm changes to Disarmed", required: false
         input "messageArmedAway", "text", title: "Send this message if alarm changes to Armed/Away", required: false
-        input "messageArmedStay", "text", title: "Send this message if alarm changes to Armed/Stay", required: fals
+        input "messageArmedStay", "text", title: "Send this message if alarm changes to Armed/Stay", required: false
         input "alarmPowerState", "bool", title: "Power State Notification", description: "This switch will tell ADT Tools to notify you when the Smartthings Panel change power sources between battery and home power", defaultValue: false, required: true, multiple: false
    		input "alarmTamperState", "bool", title: "Tamper Activity Notification", description: "This switch will tell ADT Tools to notify you if any tamper activty is detected on the Smartthings Alarm Panel", defaultValue: false, required: true, multiple: false
 
@@ -121,9 +176,27 @@ def adtNotifier()
         	paragraph "Multiple numbers can be entered as long as sperated by a (;)"
 			input "phone", "phone", title: "Enter a phone number to get SMS", required: false
 			paragraph "If outside the US please make sure to enter the proper country code."
-			input "sendPush", "enum", title: "Send Push notifications to everyone?", required: false, options: ["Yes", "No"]
+   			input "sendPush", "bool", title: "Send Push notifications to everyone?", description: "This will tell ADT Tools to send out push notifications to all users of the location", defaultValue: false, required: true, multiple: false
+//          input "sendPush", "enum", title: "Send Push notifications to everyone?", required: false, options: ["Yes", "No"]
 		}
 	}
+        section("Enable Pushover Support:") {
+    input ("pushoverEnabled", "bool", title: "Use Pushover Integration", required: false, submitOnChange: true)
+    if(settings?.pushoverEnabled == true) {
+        if(state?.isInstalled) {
+            if(!atomicState?.pushoverManager) {
+                paragraph "If this is the first time enabling Pushover than leave this page and come back if the devices list is empty"
+                pushover_init()
+            } else {
+                input "pushoverDevices", "enum", title: "Select Pushover Devices", description: "Tap to select", groupedOptions: getPushoverDevices(), multiple: true, required: false, submitOnChange: true
+                if(settings?.pushoverDevices) {
+                    input "pushoverSound", "enum", title: "Notification Sound (Optional)", description: "Tap to select", defaultValue: "pushover", required: false, multiple: false, submitOnChange: true, options: getPushoverSounds()
+                }
+            }
+        } else { paragraph "New Install Detected!!!\n\n1. Press Done to Finish the Install.\n2. Goto the Automations Tab at the Bottom\n3. Tap on the SmartApps Tab above\n4. Select ${app?.getLabel()} and Resume configuration", state: "complete" }
+    }
+}
+
 	section("Minimum time between messages (optional, defaults to every message)") {
 		input "frequency", "decimal", title: "Minutes", required: false
 	}
@@ -141,9 +214,11 @@ def adtModeChange()
         input "myDisarmButton", "capability.momentary", title: "What Button will disarm the alarm?", required: false, multiple: false
         input "myArmStay", "capability.momentary", title: "What button will put the alarm in Armed/Stay?", required: false, multiple: false
         input "myArmAway", "capability.momentary", title: "What button will put the alarm in Armed/Away?", required: false, multiple: false
-	}
+        href "adtModeAction", title: "Mode Change action", description: "Enables various functions around Mode change integration."
+	
+    }
    section("Smartthings location alarm state setup. These must be configured to use the Any Sensory Child App."){
-   		input "locAlarmSync", "bool", title: "Maintain synchronization between Smartthings ADT alarm panel and location clound alarm state", description: "This switch will tell ADT Tools if it needs to kep the ADT Alarm and the Smarthings location alarm status in sync.", defaultValue: false, required: true, multiple: false
+   		input "locAlarmSync", "bool", title: "Maintain synchronization between Smartthings ADT alarm panel and location cloud alarm state", description: "This switch will tell ADT Tools if it needs to kep the ADT Alarm and the Smarthings location alarm status in sync.", defaultValue: false, required: true, multiple: false
 		input "delay", "number", range: "1..120", title: "Please specify your Alarm Delay", required: true, defaultValue: 0
 	}
     
@@ -156,6 +231,28 @@ def adtModeChange()
     }
 }
 
+def adtModeAction()
+{
+	dynamicPage(name: "adtModeAction", title: "ADT Mode Action Selection", uninstall: false, install: false)
+    {
+	section("Select actions for when alarm enters Disarmed"){
+        input "disarmedOn", "capability.switch", title: "What switch to turn on when disarmed?", required: false, multiple: false
+        input "disarmedOff", "capability.switch", title: "What switch to turn off when disarmed?", required: false, multiple: false
+	}
+   section("Select action for when alarm enters Armed/Stay"){
+   		input "armedStayOn", "capability.switch", title: "What switch to turn on when armed/stay?", required: false, multiple: false
+		input "armedStayOff", "capability.switch", title: "What swtich to turn off when armed/stay?", required: false, multiple: false
+	} 
+   section("Select action for when alarm enters Armed/Away"){
+   		input "armedAwayOn", "capability.switch", title: "What switch to turn on when armed/away?", required: false, multiple: false
+		input "armedAwayOff", "capability.switch", title: "What switch to turn off when armed/away?", required: false, multiple: false
+	} 
+    section ("Return to ADT Tools Main page"){
+            href "adtModeChange", title: "ADT Tools Main Menu", description: "Return to main ADT Tools Main Menu"            
+		}
+    }
+}
+
 def adtAlertActions()
 {
 	dynamicPage(name: "adtAlertActions", title: "ADT Alert Actions ", uninstall: false, install: false)
@@ -163,6 +260,7 @@ def adtAlertActions()
         section ("Alarm Event Action Apps"){
             app(name: "adtAlertAction", appName: "ADT Alert Action", namespace: "Mavrrick", title: "Security Alert Action apps", multiple: true)
             app(name: "adtHomeAction", appName: "ADT Home-Life Alert Action", namespace: "Mavrrick", title: "Home/Life Alert Action apps", multiple: true)
+            app(name: "adtPanicAction", appName: "ADT Panic Alert Action", namespace: "Mavrrick", title: "Panic Alert Action apps", multiple: true)
 		}
         section ("Return to ADT Tools Main page"){
             href "mainPage", title: "ADT Tools Main Menu", description: "Return to main ADT Tools Main Menu"            
@@ -193,13 +291,13 @@ def about()
 		}
         section("Support locations")
 		{
-			href "thingsAreSmart", style:"embedded", title: "Things That Are Smart Support Page", url: "http://thingsthataresmart.wiki/index.php?title=ADT_tools_2"
-			href "smtReleaseThd", style:"embedded", title: "Smartthings Community Support Thread", url: "https://community.smartthings.com/t/released-adt-tools-2-for-smartthings-adt-alarm-sytsems/124951"
+			href (name: "thingsAreSmart", style:"embedded", title: "Things That Are Smart Support Page", url: "http://thingsthataresmart.wiki/index.php?title=ADT_tools_2")
+			href (name: "smtReleaseThd", style:"embedded", title: "Smartthings Community Support Thread", url: "https://community.smartthings.com/t/released-adt-tools-2-for-smartthings-adt-alarm-sytsems/124951")
 		}
         section("Support the Project")
 		{
 			paragraph "ADT Tools is provided free for personal and non-commercial use.  I have worked on this app in my free time to fill the needs I have found for myself and others like you.  I will continue to make improvements where I can. If you would like you can donate to continue to help with development please use the link below."
-			href "donate", style:"embedded", title: "Consider making a \$5 or \$10 donation today.", image: "https://storage.googleapis.com/arlopilot/donate-icon.png", url: "https://www.paypal.me/mavrrick58"
+			href (name: "donate", style:"embedded", title: "Consider making a \$5 or \$10 donation today.", image: "https://lh4.googleusercontent.com/-1dmLp--W0OE/AAAAAAAAAAI/AAAAAAAAEYU/BRuIXPPiOmI/s0-c-k-no-ns/photo.jpg", url: "https://www.paypal.me/mavrrick58")
 		}
         section ("Return to ADT Tools Main page"){
             href "mainPage", title: "ADT Tools Main Menu", description: "Return to main ADT Tools Main Menu"            
@@ -210,6 +308,8 @@ def about()
 def installed() {
 	log.debug "Installed with settings: ${settings}"
 	subscribeToEvents()
+    state?.isInstalled = true
+    state.crtVrtButton = false
     initialize()
 }
 
@@ -256,7 +356,7 @@ def armstayHandler(evt) {
         	log.debug "Current alarm mode: ${alarmState}. Alarm must be in Disarmed state before changeing state"
         }
         else {       
-        panel?.armStay(armedStay)
+        panel?.armStay(true)
 
         }
 	}
@@ -268,7 +368,7 @@ def armawayHandler(evt) {
         	log.debug "Current alarm mode: ${alarmState}. Alarm must be in Disarmed state before changeing state"
         }
         else {
-      	panel?.armAway(armedAway)}
+      	panel?.armAway(true)}
 	   }
 
 def alarmModeHandler(evt) {
@@ -303,6 +403,7 @@ def alarmModeHandler(evt) {
                     break
                     }
         }
+	modeAction(evt)
 }
 
 def armstaySHMHandler() {
@@ -336,9 +437,24 @@ switch (evt.value)
             log.debug("Sending SMS to ${phone}")
             sendSmsMessage(phone, msg)
         }
-    } else if (settings.sendPush) {
+    }
+    	if(settings?.pushoverEnabled == true) {
+    		    Map msgObj = [
+       				title: app?.getLabel(), //Optional and can be what ever
+       				html: false, //Optional see: https://pushover.net/api#html
+    				message: msg, //Required (HTML markup requires html: true, parameter)
+        			priority: 0,  //Optional
+        			retry: 30, //Requried only when sending with High-Priority
+        			expire: 10800, //Requried only when sending with High-Priority
+        			sound: settings?.pushoverSound, //Optional
+//        			url: "https://www.foreverbride.com/files/6414/7527/3346/test.png", //Optional
+//        			url_title: "ADT Tools Mode Change Armed/Away" //Optional
+					]
+    buildPushMessage(settings?.pushoverDevices, msgObj, true) // This method is part of the required code block
+		}
+    if (settings.sendPush) {
         log.debug("Sending Push to everyone")
-        sendPushMessage(msg)
+        sendPush(msg)
     }
     sendNotificationEvent(msg)	
     }
@@ -362,9 +478,24 @@ switch (evt.value)
             log.debug("Sending SMS to ${phone}")
             sendSmsMessage(phone, msg)
         }
-    } else if (settings.sendPush) {
+    }
+    	if(settings?.pushoverEnabled == true) {
+    		    Map msgObj = [
+       				title: app?.getLabel(), //Optional and can be what ever
+       				html: false, //Optional see: https://pushover.net/api#html
+    				message: msg, //Required (HTML markup requires html: true, parameter)
+        			priority: 0,  //Optional
+        			retry: 30, //Requried only when sending with High-Priority
+        			expire: 10800, //Requried only when sending with High-Priority
+        			sound: settings?.pushoverSound, //Optional
+//        			url: "https://www.foreverbride.com/files/6414/7527/3346/test.png", //Optional
+//        			url_title: "ADT Tools Mode Chage Armed/Stay" //Optional
+					]
+    buildPushMessage(settings?.pushoverDevices, msgObj, true) // This method is part of the required code block
+		}
+    if (settings.sendPush) {
         log.debug("Sending Push to everyone")
-        sendPushMessage(msg)
+        sendPush(msg)
     }
     sendNotificationEvent(msg)	
     }
@@ -388,9 +519,24 @@ switch (evt.value)
             log.debug("Sending SMS to ${phone}")
             sendSmsMessage(phone, msg)
         }
-    } else if (settings.sendPush) {
+    }
+    	if(settings?.pushoverEnabled == true) {
+    		    Map msgObj = [
+       				title: app?.getLabel(), //Optional and can be what ever
+       				html: false, //Optional see: https://pushover.net/api#html
+    				message: msg, //Required (HTML markup requires html: true, parameter)
+        			priority: 0,  //Optional
+        			retry: 30, //Requried only when sending with High-Priority
+        			expire: 10800, //Requried only when sending with High-Priority
+        			sound: settings?.pushoverSound, //Optional
+//        			url: "https://www.foreverbride.com/files/6414/7527/3346/test.png", //Optional
+//        			url_title: "ADT Tools Mode Change Disarm" //Optional
+					]
+    buildPushMessage(settings?.pushoverDevices, msgObj, true) // This method is part of the required code block
+		}
+    if (settings.sendPush) {
         log.debug("Sending Push to everyone")
-        sendPushMessage(msg)
+        sendPush(msg)
     }
     sendNotificationEvent(msg)	
     }
@@ -420,9 +566,24 @@ def adtPowerHandler(evt) {
             log.debug("Sending SMS to ${phone}")
             sendSmsMessage(phone, msg)
         }
-    } else if (settings.sendPush) {
+    }
+    	if(settings?.pushoverEnabled == true) {
+    		    Map msgObj = [
+       				title: app?.getLabel(), //Optional and can be what ever
+       				html: false, //Optional see: https://pushover.net/api#html
+    				message: msg, //Required (HTML markup requires html: true, parameter)
+        			priority: 0,  //Optional
+        			retry: 30, //Requried only when sending with High-Priority
+        			expire: 10800, //Requried only when sending with High-Priority
+        			sound: settings?.pushoverSound, //Optional
+//        			url: "https://www.foreverbride.com/files/6414/7527/3346/test.png", //Optional
+//        			url_title: "ADT Tools Mode Chage Armed/Stay" //Optional
+					]
+    buildPushMessage(settings?.pushoverDevices, msgObj, true) // This method is part of the required code block
+		}
+    if (settings.sendPush) {
         log.debug("Sending Push to everyone")
-        sendPushMessage(msg)
+        sendPush(msg)
     }
     sendNotificationEvent(msg)	
 		break
@@ -441,9 +602,24 @@ def adtPowerHandler(evt) {
             log.debug("Sending SMS to ${phone}")
             sendSmsMessage(phone, msg)
         }
-    } else if (settings.sendPush) {
+    }
+    	if(settings?.pushoverEnabled == true) {
+    		    Map msgObj = [
+       				title: app?.getLabel(), //Optional and can be what ever
+       				html: false, //Optional see: https://pushover.net/api#html
+    				message: msg, //Required (HTML markup requires html: true, parameter)
+        			priority: 0,  //Optional
+        			retry: 30, //Requried only when sending with High-Priority
+        			expire: 10800, //Requried only when sending with High-Priority
+        			sound: settings?.pushoverSound, //Optional
+//        			url: "https://www.foreverbride.com/files/6414/7527/3346/test.png", //Optional
+//        			url_title: "ADT Tools Mode Chage Armed/Stay" //Optional
+					]
+    buildPushMessage(settings?.pushoverDevices, msgObj, true) // This method is part of the required code block
+		}
+    if (settings.sendPush) {
         log.debug("Sending Push to everyone")
-        sendPushMessage(msg)
+        sendPush(msg)
     }
     sendNotificationEvent(msg)	
 		break
@@ -473,9 +649,24 @@ def adtTamperHandler(evt) {
             log.debug("Sending SMS to ${phone}")
             sendSmsMessage(phone, msg)
         }
-    } else if (settings.sendPush) {
+    }
+    	if(settings?.pushoverEnabled == true) {
+    		    Map msgObj = [
+       				title: app?.getLabel(), //Optional and can be what ever
+       				html: false, //Optional see: https://pushover.net/api#html
+    				message: msg, //Required (HTML markup requires html: true, parameter)
+        			priority: 0,  //Optional
+        			retry: 30, //Requried only when sending with High-Priority
+        			expire: 10800, //Requried only when sending with High-Priority
+        			sound: settings?.pushoverSound, //Optional
+//        			url: "https://www.foreverbride.com/files/6414/7527/3346/test.png", //Optional
+//        			url_title: "ADT Tools Mode Chage Armed/Stay" //Optional
+					]
+    buildPushMessage(settings?.pushoverDevices, msgObj, true) // This method is part of the required code block
+		}
+    if (settings.sendPush) {
         log.debug("Sending Push to everyone")
-        sendPushMessage(msg)
+        sendPush(msg)
     }
     sendNotificationEvent(msg)	
 		break
@@ -494,9 +685,24 @@ def adtTamperHandler(evt) {
             log.debug("Sending SMS to ${phone}")
             sendSmsMessage(phone, msg)
         }
-    } else if (settings.sendPush) {
+    }
+    	if(settings?.pushoverEnabled == true) {
+    		    Map msgObj = [
+       				title: app?.getLabel(), //Optional and can be what ever
+       				html: false, //Optional see: https://pushover.net/api#html
+    				message: msg, //Required (HTML markup requires html: true, parameter)
+        			priority: 0,  //Optional
+        			retry: 30, //Requried only when sending with High-Priority
+        			expire: 10800, //Requried only when sending with High-Priority
+        			sound: settings?.pushoverSound, //Optional
+//        			url: "https://www.foreverbride.com/files/6414/7527/3346/test.png", //Optional
+//        			url_title: "ADT Tools Mode Chage Armed/Stay" //Optional
+					]
+    buildPushMessage(settings?.pushoverDevices, msgObj, true) // This method is part of the required code block
+		}
+    if (settings.sendPush) {
         log.debug("Sending Push to everyone")
-        sendPushMessage(msg)
+        sendPush(msg)
     }
     sendNotificationEvent(msg)	
 		break
@@ -505,4 +711,34 @@ def adtTamperHandler(evt) {
         log.debug "$evt.name:$evt.value, sendPush:$sendPush, '$msg'"
         break
 	   }
-       }       
+       }   
+       
+def modeAction(evt){
+
+	switch (evt.value) {
+    case "armedAway":
+    	if (armedAwayOn){
+        	armedAwayOn?.on()
+            }
+         if (armedAwayOff) {
+         	armedAwayOff?.off()
+            }
+    break
+    case "armedStay":
+    	 if (armedStayOn){
+        	armedStayOn?.on()
+            }
+         if (armedStayOff) {
+         	armedStayOff?.off()
+            }
+    break
+    case "disarmed":
+    	if (disarmedOn){
+        	disarmedOn?.on()
+            }
+         if (disarmedOff) {
+         	disarmedOff?.off()
+           	}
+    break
+    }
+    }
